@@ -1,10 +1,11 @@
+# Code from Andrej Karpathy : https://github.com/karpathy/ng-video-lecture
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset, DataLoader
 from typing import Optional
-import pytorch_lightning as pl
-from nanogpt import Block
+import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 
@@ -26,7 +27,7 @@ class CharDataset(Dataset):
         return input_seq, target_seq
 
 
-class nanoGPT_data(pl.LightningDataModule):
+class nanoGPT_data(L.LightningDataModule):
     def __init__(self, text: str = "", batch_size: int = 64, block_size: int = 128):
         super().__init__()
         self.text = text
@@ -62,8 +63,82 @@ class nanoGPT_data(pl.LightningDataModule):
         return DataLoader(self.test_dataset, batch_size=self.batch_size)
 
 
-class GPTLanguageModel(pl.LightningModule):
-    def __init__(self, n_embd, n_head, n_layer, block_size, dropout, learning_rate):
+class Head(nn.Module):
+    def __init__(self, n_embd, head_size, block_size, dropout=0.2):
+        super().__init__()
+        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.query = nn.Linear(n_embd, head_size, bias=False)
+        self.value = nn.Linear(n_embd, head_size, bias=False)
+        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # input of size (batch, time-step, channels)
+        # output of size (batch, time-step, head size)
+        B, T, C = x.shape
+        q = self.query(x)  # (B,T,hs)
+        k = self.key(x)  # (B,T,hs)
+        v = self.value(x)  # (B,T,hs)
+        # compute attention scores ("affinities")
+        weights = (
+            q @ k.transpose(-2, -1) / (C**0.5)
+        )  # (B, T, hs) @ (B, hs, T) -> (B, T, T)
+        weights = weights.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
+        weights = F.softmax(weights, dim=-1)  # (B, T, T)
+        # perform the weighted aggregation of the values
+        out = weights @ v  # (B, T, T) @ (B, T, hs) -> (B, T, hs)
+        return out
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, n_embd, n_head, head_size, block_size, dropout=0.2):
+        super().__init__()
+        self.heads = nn.ModuleList(
+            [Head(n_embd, head_size, block_size, dropout) for _ in range(n_head)]
+        )  ##DD1
+        self.proj = nn.Linear(n_head * head_size, n_embd)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.proj(out)
+        out = self.dropout(out)
+        return out
+
+
+class FeedForward(nn.Module):
+    def __init__(self, n_embd, dropout=0.2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.Tanh(),
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Block(nn.Module):
+    def __init__(self, n_embd, n_head, block_size, dropout=0.2):
+        super().__init__()
+        head_size = n_embd // n_head
+        self.ma = MultiHeadAttention(n_embd, n_head, head_size, block_size, dropout)
+        self.ff = FeedForward(n_embd, dropout)
+        self.ln1 = nn.LayerNorm(n_embd, dropout)
+        self.ln2 = nn.LayerNorm(n_embd, dropout)
+
+    def forward(self, x):
+        x = x + self.ma(self.ln1(x))
+        x = x + self.ff(self.ln2(x))
+        return x
+
+
+class GPTLanguageModel(L.LightningModule):
+    def __init__(
+        self, n_embd, n_head, n_layer, vocab_size, block_size, dropout, learning_rate
+    ):
         super().__init__()
         self.save_hyperparameters()
         self.token_embedding_table = nn.Embedding(
@@ -74,16 +149,18 @@ class GPTLanguageModel(pl.LightningModule):
         )
         self.blocks = nn.Sequential(
             *[
-                Block(self.hparams.n_embd, self.hparams.n_head, self.hparams.dropout)
+                Block(
+                    self.hparams.n_embd,
+                    self.hparams.n_head,
+                    self.hparams.block_size,
+                    self.hparams.dropout,
+                )
                 for _ in range(n_layer)
             ]
         )  # DD2
         self.ln_f = nn.LayerNorm(self.hparams.n_embd)
         self.lm_head = nn.Linear(self.hparams.n_embd, self.hparams.vocab_size)
         self.apply(self._init_weights)
-
-        # report number of parameters
-        print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -97,11 +174,13 @@ class GPTLanguageModel(pl.LightningModule):
         B, T = idx.shape
         # idx and targets are both (B,T) tensor of integers
         tok_emb = self.token_embedding_table(idx)  # (B,T,C)
-        pos_emb = self.position_embedding_table(torch.arange(T))  # (T,C)
+        pos_emb = self.position_embedding_table(
+            torch.arange(T, device=idx.device)
+        )  # (T,C)
         x = tok_emb + pos_emb  # (B,T,C)
         x = self.blocks(x)  # (B,T,C)
         x = self.ln_f(x)  # (B,T,C)
-        logits = self.lm_head(x)  # (B,T,vocab_size)
+        logits = self.lm_head(x)  # (B,T,V)
 
         if targets is None:
             loss = None
@@ -117,6 +196,7 @@ class GPTLanguageModel(pl.LightningModule):
         x, y = batch
         logits, loss = self(x, y)
         self.log("train_loss", loss)
+        print("train_loss", loss)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -137,9 +217,9 @@ class GPTLanguageModel(pl.LightningModule):
             # get the predictions
             logits, loss = self(idx_cond)
             # focus only on the last time step
-            logits = logits[:, -1, :]  # becomes (B, vocab_size)
+            logits = logits[:, -1, :]  # becomes (B, V)
             # apply softmax to get probabilities
-            probs = F.softmax(logits, dim=-1)  # (B, vocab_size)
+            probs = F.softmax(logits, dim=-1)  # (B, V)
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
             # append sampled index to the running sequence
@@ -183,14 +263,20 @@ def main():
     itos = {i: ch for ch, i in stoi.items()}
     text = torch.tensor([stoi[c] for c in text], dtype=torch.long)
 
-    data_module = nanoGPT_data(data=text, batch_size=batch_size, block_size=block_size)
+    data_module = nanoGPT_data(text=text, batch_size=batch_size, block_size=block_size)
     model = GPTLanguageModel(
         n_embd=n_embd,
         n_head=n_head,
         n_layer=n_layer,
+        vocab_size=vocab_size,
         block_size=block_size,
         dropout=dropout,
         learning_rate=learning_rate,
+    )
+
+    print(
+        sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6,
+        "M trainable parameters",
     )
 
     model_checkpoint = ModelCheckpoint(
@@ -204,7 +290,7 @@ def main():
 
     wandb_logger = WandbLogger(project=experiment_name)
 
-    trainer = pl.Trainer(
+    trainer = L.Trainer(
         limit_train_batches=500,
         limit_val_batches=20,
         max_epochs=5,
