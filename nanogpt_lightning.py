@@ -1,4 +1,6 @@
-# Code from Andrej Karpathy : https://github.com/karpathy/ng-video-lecture
+# Rewrite the ng-video-lecture code from Andrej Karpathy with Lightning
+# framework for multi-gpu training
+# https://github.com/karpathy/ng-video-lecture
 
 import torch
 import torch.nn as nn
@@ -39,16 +41,17 @@ class nanoGPT_data(L.LightningDataModule):
         # download, split, etc...
         # only called on 1 GPU/TPU in distributed
         # only create the data once
-        with open(self.hparams.data_dir, "r") as f:
-            text = f.read()
-        chars = sorted(list(set(text)))
-        self.stoi = {ch: i for i, ch in enumerate(chars)}
-        self.itos = {i: ch for ch, i in self.stoi.items()}
-        self.text = torch.tensor([self.stoi[c] for c in text], dtype=torch.long)
+        pass
 
     def setup(self, stage: Optional[str] = None):
         # make assignments here (val/train/test split)
         # called on every process in DDP
+        with open(self.hparams.data_dir, "r") as f:
+            self.text = f.read()
+        chars = sorted(list(set(self.text)))
+        self.stoi = {ch: i for i, ch in enumerate(chars)}
+        self.itos = {i: ch for ch, i in self.stoi.items()}
+        self.text = torch.tensor([self.stoi[c] for c in self.text], dtype=torch.long)
         n1 = int(0.8 * len(self.text))
         n2 = int(0.9 * len(self.text))
 
