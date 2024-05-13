@@ -8,6 +8,9 @@ from typing import Optional
 import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
+import wandb
+
+wandb.init(settings=wandb.Settings(console="off"))
 
 
 class CharDataset(Dataset):
@@ -28,17 +31,20 @@ class CharDataset(Dataset):
 
 
 class nanoGPT_data(L.LightningDataModule):
-    def __init__(self, text: str = "", batch_size: int = 64, block_size: int = 128):
+    def __init__(self, data_dir: str = "", batch_size: int = 64, block_size: int = 128):
         super().__init__()
-        self.text = text
-        self.batch_size = batch_size
-        self.block_size = block_size
+        self.save_hyperparameters()
 
     def prepare_data(self):
         # download, split, etc...
         # only called on 1 GPU/TPU in distributed
         # only create the data once
-        pass
+        with open(self.hparams.data_dir, "r") as f:
+            text = f.read()
+        chars = sorted(list(set(text)))
+        self.stoi = {ch: i for i, ch in enumerate(chars)}
+        self.itos = {i: ch for ch, i in self.stoi.items()}
+        self.text = torch.tensor([self.stoi[c] for c in text], dtype=torch.long)
 
     def setup(self, stage: Optional[str] = None):
         # make assignments here (val/train/test split)
@@ -47,20 +53,22 @@ class nanoGPT_data(L.LightningDataModule):
         n2 = int(0.9 * len(self.text))
 
         if stage == "fit" or stage is None:
-            self.train_dataset = CharDataset(self.text[:n1], self.block_size)
-            self.val_dataset = CharDataset(self.text[n1:n2], self.block_size)
+            self.train_dataset = CharDataset(self.text[:n1], self.hparams.block_size)
+            self.val_dataset = CharDataset(self.text[n1:n2], self.hparams.block_size)
 
         if stage == "test" or stage is None:
             self.test_dataset = CharDataset(self.text[n2:], self.block_size)
 
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True)
+        return DataLoader(
+            self.train_dataset, batch_size=self.hparams.batch_size, shuffle=True
+        )
 
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size)
+        return DataLoader(self.val_dataset, batch_size=self.hparams.batch_size)
 
     def test_dataloader(self):
-        return DataLoader(self.test_dataset, batch_size=self.batch_size)
+        return DataLoader(self.test_dataset, batch_size=self.hparams.batch_size)
 
 
 class Head(nn.Module):
@@ -175,7 +183,7 @@ class GPTLanguageModel(L.LightningModule):
         # idx and targets are both (B,T) tensor of integers
         tok_emb = self.token_embedding_table(idx)  # (B,T,C)
         pos_emb = self.position_embedding_table(
-            torch.arange(T, device=idx.device)
+            torch.arange(T, device=idx.device)  # DD3
         )  # (T,C)
         x = tok_emb + pos_emb  # (B,T,C)
         x = self.blocks(x)  # (B,T,C)
@@ -196,24 +204,25 @@ class GPTLanguageModel(L.LightningModule):
         x, y = batch
         logits, loss = self(x, y)
         self.log("train_loss", loss)
-        print("train_loss", loss)
+        print("train_loss : ", loss)
         return loss
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
         logits, loss = self(x, y)
         self.log("val_loss", loss)
-        print("val_loss", loss)
+        print("val_loss : ", loss)
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.hparams.learning_rate)
 
     def generate(self, idx, max_new_tokens):
+        self.to(idx.device)  # DD4
         # idx is (B, T) array of indices in the current context
         results = []  # To store the output indices for decoding later
         for _ in range(max_new_tokens):
             # crop idx to the last block_size tokens
-            idx_cond = idx[:, -self.trainer.datamodule.block_size :]
+            idx_cond = idx[:, -self.trainer.datamodule.hparams.block_size :]
             # get the predictions
             logits, loss = self(idx_cond)
             # focus only on the last time step
@@ -241,11 +250,9 @@ def main():
     # hyperparameters
     batch_size = 64  # (B) how many independent sequences will we process in parallel?
     block_size = 256  # (T) what is the maximum context length for predictions?
+    vocab_size = 67  # (V) how big is our vocabulary
     max_iters = 5000  # how many training iterations
-    eval_interval = 500  # how often to evaluate the model?
     learning_rate = 3e-4
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    eval_iters = 200  # how many iterations to use for evaluation
     n_embd = 384  # (C) how many dimensions per token
     n_head = 6  # how many attention heads?
     n_layer = 6  # how many layers?
@@ -255,15 +262,10 @@ def main():
     experiment_name = "nanoGPT"
     # ------------
 
-    with open(data_dir, "r") as f:
-        text = f.read()
-    chars = sorted(list(set(text)))
-    vocab_size = len(chars)  # (V) how big is our vocabulary
-    stoi = {ch: i for i, ch in enumerate(chars)}
-    itos = {i: ch for ch, i in stoi.items()}
-    text = torch.tensor([stoi[c] for c in text], dtype=torch.long)
+    data_module = nanoGPT_data(
+        data_dir=data_dir, batch_size=batch_size, block_size=block_size
+    )
 
-    data_module = nanoGPT_data(text=text, batch_size=batch_size, block_size=block_size)
     model = GPTLanguageModel(
         n_embd=n_embd,
         n_head=n_head,
@@ -273,6 +275,10 @@ def main():
         dropout=dropout,
         learning_rate=learning_rate,
     )
+
+    # model = GPTLanguageModel.load_from_checkpoint(
+    #     checkpoint_path="/home2/cye73/StatisticalML/nanoGPT/nanoGPT-epoch=4-val_loss=1.41.ckpt"
+    # )
 
     print(
         sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6,
@@ -293,7 +299,8 @@ def main():
     trainer = L.Trainer(
         limit_train_batches=500,
         limit_val_batches=20,
-        max_epochs=5,
+        num_sanity_val_steps=0,
+        max_epochs=12,
         devices=[0, 1, 2, 3],
         accelerator="gpu",
         strategy="ddp_find_unused_parameters_true",
@@ -305,11 +312,12 @@ def main():
 
     trainer.fit(model, datamodule=data_module)
 
+    print("model.device :", model.device)
     # generate from the model
     context = torch.zeros((1, 1), dtype=torch.long, device=device)
-    generated_text = model.generate(context, max_new_tokens=1000)
+    generated_text = model.generate(idx=context, max_new_tokens=1000)
     print(generated_text)
-    open("more2.txt", "w").write(model.generate(context, max_new_tokens=10000))
+    open("more.txt", "w").write(model.generate(context, max_new_tokens=10000))
 
 
 if __name__ == "__main__":
