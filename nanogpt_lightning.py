@@ -269,19 +269,19 @@ def main():
         data_dir=data_dir, batch_size=batch_size, block_size=block_size
     )
 
-    model = GPTLanguageModel(
-        n_embd=n_embd,
-        n_head=n_head,
-        n_layer=n_layer,
-        vocab_size=vocab_size,
-        block_size=block_size,
-        dropout=dropout,
-        learning_rate=learning_rate,
-    )
-
-    # model = GPTLanguageModel.load_from_checkpoint(
-    #     checkpoint_path="/home2/cye73/StatisticalML/nanoGPT/nanoGPT-epoch=4-val_loss=1.41.ckpt"
+    # model = GPTLanguageModel(
+    #     n_embd=n_embd,
+    #     n_head=n_head,
+    #     n_layer=n_layer,
+    #     vocab_size=vocab_size,
+    #     block_size=block_size,
+    #     dropout=dropout,
+    #     learning_rate=learning_rate,
     # )
+
+    model = GPTLanguageModel.load_from_checkpoint(
+        checkpoint_path="/home2/cye73/StatisticalML/nanoGPT/nanoGPT-epoch=6-val_loss=1.38.ckpt"
+    )
 
     print(
         sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6,
@@ -300,11 +300,14 @@ def main():
     wandb_logger = WandbLogger(project=experiment_name)
 
     trainer = L.Trainer(
-        limit_train_batches=500,
-        limit_val_batches=20,
+        limit_train_batches=0,
+        devices=[0],
+        max_epochs=0,
+        # limit_train_batches=1000,
+        # devices=[0, 1, 2, 3],
+        # max_epochs=10,
+        limit_val_batches=200,
         num_sanity_val_steps=0,
-        max_epochs=12,
-        devices=[0, 1, 2, 3],
         accelerator="gpu",
         strategy="ddp_find_unused_parameters_true",
         enable_progress_bar=True,
@@ -315,9 +318,8 @@ def main():
 
     trainer.fit(model, datamodule=data_module)
 
-    print("model.device :", model.device)
     # generate from the model
-    context = torch.zeros((1, 1), dtype=torch.long, device=device)
+    context = torch.zeros((1, 1), dtype=torch.long)
     generated_text = model.generate(idx=context, max_new_tokens=1000)
     print(generated_text)
     open("more.txt", "w").write(model.generate(context, max_new_tokens=10000))
